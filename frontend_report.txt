@@ -1,0 +1,206 @@
+TRUSTRAG FRONTEND — AUDIT REPORT
+Generated: 2026-10-27
+
+================================================================================
+1. STACK & TOOLING
+================================================================================
+Framework      : React 19.2.8 (JSX, no TypeScript)
+Build tool     : Vite 8.2.0 (plugin: @vitejs/plugin-react 6.0.4)
+Node version   : v22.23.2
+Package manager: npm (package-lock.json present)
+
+Install        : npm install
+Run frontend   : npm run dev            → Vite dev server on port 5173
+Run backend    : npm run server          → Express server on port 5000 (from .env)
+Run both       : npm run dev:all         → concurrently runs server + dev
+Production     : npm run build           → vite build → dist/
+Deploy         : npm run deploy          → vercel --prod
+Port (frontend): 5173 (hardcoded in vite.config.js)
+Port (backend) : 5000 (from .env, fallback 5000 in server/index.js)
+
+================================================================================
+2. FILE TREE (important files)
+================================================================================
+index.html                          HTML shell, mounts React at #root
+package.json                        Dependencies, scripts, metadata
+vite.config.js                      Vite config: port 5173, proxy /api → localhost:5000
+.env                                Backend port (PORT=5000)
+.env.example                        Env template with GEMINI/OPENAI/GROQ key placeholders
+vercel.json                         Vercel rewrite rules for serverless deployment
+
+src/main.jsx                        React entry point, renders <App /> into #root
+src/App.jsx                         Entire UI: chat, sidebar, trust ring, sources panel (~816 lines)
+src/App.css                         All component styles (~560+ lines)
+src/index.css                       CSS reset (box-sizing, margin/padding)
+src/assets/                         Static images (hero.png, react.svg, vite.svg)
+public/favicon.svg                  Favicon SVG
+public/icons.svg                    Icon sprite
+
+api/index.js                        Vercel serverless entry; Express app mounting /api routes
+server/index.js                     Express server entry (local dev); serves API + static dist/
+server/routes/api.js                REST routes: /chat, /suggestions, /feedback, /bookmarks, /documents/analyze, /health
+server/services/ragEngine.js        Core RAG engine: query preprocessing, knowledge search, LLM/fallback answer synthesis, trust scoring
+server/services/llmService.js       Multi-provider LLM caller (Gemini, Groq, OpenAI); returns null if no key → falls back to local
+server/services/trustScorer.js      Computes trust_score (50 base + statute/case/procedural/relevance bonuses, clamped 15–98)
+server/data/legalKnowledgeBase.js   Hardcoded Indian law knowledge base: 12 statutes, 8 case laws, sample suggestions, categories
+
+================================================================================
+3. HOW THE CHAT GETS ITS REPLY
+================================================================================
+Real call — NOT mock data, NOT a fake function.
+
+File     : src/App.jsx
+Function : handleSend (line 237)
+Call     : fetch("/api/chat", { method: "POST", body: { question, category } })
+
+The frontend POSTs to /api/chat. In local dev, Vite proxies /api/* to
+http://localhost:5000 (vite.config.js line 11). The Express server at
+server/index.js handles it via server/routes/api.js, which calls
+processLegalQuery() in server/services/ragEngine.js.
+
+HOWEVER, on fetch failure (catch block, line 281), the UI silently substitutes
+a hardcoded fallback response using defaultInitialResponse with a fabricated
+trust_score of 88 — the user sees no error. This is effectively a "fake answer
+on error."
+
+Backend / server code in the repo:
+  server/index.js              Express HTTP server (Node.js), port 5000
+  server/routes/api.js         REST API routes (chat, suggestions, feedback, bookmarks, doc analyze)
+  server/services/ragEngine.js RAG retrieval + answer synthesis engine
+  server/services/llmService.js  LLM provider integration (Gemini, Groq, OpenAI)
+  server/services/trustScorer.js Trust score calculator
+  server/data/legalKnowledgeBase.js  Hardcoded statute + case law corpus
+  api/index.js                 Vercel serverless wrapper for the same Express routes
+
+No Firebase, Supabase, or third-party BaaS is used.
+
+================================================================================
+4. RESPONSE SHAPE — UI vs. BACKEND CONTRACT
+================================================================================
+
+A. Shape the UI expects today (from server/services/ragEngine.js, wrapped by api.js in {success, data}):
+   {
+     success: true,
+     data: {
+       query:            string
+       answer:           string
+       trust_score:      number (15–98, never null)
+       confidence_label: string ("High Confidence" | "Medium Confidence" | "Low Confidence")
+       badge_title:      string
+       badge_sub:        string
+       color:            string (hex color)
+       factors:          string[]
+       sources:          [ { id, title, subtitle, tag, icon, details } ]
+     }
+   }
+
+B. Shape from the FastAPI contract:
+   {
+     answer:           string
+     trust_score:      number | null
+     label:            "High" | "Medium" | "Low" | "Abstained" | "Unverified"
+     score_type:       "support_only" | "combined" | null
+     sources:          [ { source: string, section_number: string } ]
+     abstained:        bool
+     latency_seconds:  number
+   }
+
+C. Field-by-field differences:
+
+   FIELD              UI EXPECTS                  CONTRACT PROVIDES           DIFF
+   ────────────────── ─────────────────────────── ─────────────────────────── ──────────────────
+   Wrapper            {success:true, data:{…}}    flat JSON object            UI reads result.data; contract has no wrapper
+   answer             data.answer                 answer                      Same semantics; path differs due to wrapper
+   trust_score        data.trust_score (number)   trust_score (number|null)   UI never handles null; falls back to 90 via || 90
+   confidence_label   data.confidence_label       —                           MISSING from contract; UI derives display label from this
+   label              —                           label                       UI does not read this field
+   badge_title        data.badge_title            —                           MISSING from contract
+   badge_sub          data.badge_sub              —                           MISSING from contract
+   color              data.color                  —                           MISSING from contract
+   factors            data.factors                —                           MISSING from contract
+   score_type         —                           score_type                  UI does not consume this
+   abstained          —                           abstained                   UI does not consume this
+   latency_seconds    —                           latency_seconds             UI does not consume this
+   sources            [{id,title,subtitle,        [{source,section_number}]   COMPLETELY DIFFERENT shape
+                        tag,icon,details}]
+   query              data.query                  —                           MISSING from contract
+   Error response     HTTP non-ok → catch         503 + {detail}              UI checks response.ok but doesn't read detail; silently injects hardcoded answer
+
+   SUMMARY: The UI will NOT work with the FastAPI backend as-is. At minimum:
+   1. UI expects { success: true, data: { … } } wrapper — contract returns flat JSON.
+   2. sources shape is totally different ({title,subtitle,tag,icon} vs {source,section_number}).
+   3. UI uses confidence_label, badge_title, badge_sub, color, factors — none exist in contract.
+   4. Contract fields label, score_type, abstained, latency_seconds are ignored by the UI.
+   5. trust_score=null will render as 90% in the ring (silent fallback, misleading).
+
+================================================================================
+5. FEATURE CHECKLIST
+================================================================================
+
+FEATURE                                       YES/NO   FILE / DETAIL
+──────────────────────────────────────────── ──────── ───────────────────────────────────────────────
+Shows a score                                 YES      src/App.jsx (TrustScoreRing component, line 18; right panel, line 763)
+Hides score when trust_score is null          NO       src/App.jsx line 763: uses `|| 90` — renders 90% instead of hiding
+Shows all five labels (High, Medium, Low,     NO       src/App.jsx line 23: only "High Confidence", "Medium Confidence",
+  Abstained, Unverified)                                "Low Confidence". Missing: "Abstained", "Unverified"
+Shows sources as chips                        NO       src/App.jsx lines 783–797: vertical list with icon/title/subtitle/tag, not chips
+Has a loading spinner                         YES      src/App.jsx lines 681–695: typing-dots animation + text
+Disables Send while loading                   NO       src/App.jsx line 718: disabled={!question.trim()} — only checks empty input, not loading state
+Handles HTTP errors                           PARTIAL  src/App.jsx lines 263–265: checks response.ok, but catch block (line 281) silently injects a FAKE answer
+Handles network errors                        NO       Same catch block swallows network errors; user cannot tell real answer from failure
+Has a request timeout                         NO       No AbortController, no signal, no timeout in any fetch call. Value: N/A
+Footer "Academic prototype, not legal advice" NO       src/App.jsx line 750: actual text is "TrustRAG provides AI legal assistance. Please verify important citations with official court records."
+
+================================================================================
+6. API ADDRESS
+================================================================================
+
+The frontend uses RELATIVE paths: fetch("/api/chat"), fetch("/api/suggestions"), etc.
+
+In local dev, the Vite dev server proxies /api/* to http://localhost:5000
+(HARDCODED in vite.config.js, line 11).
+
+There is NO environment variable for the API URL in the frontend code.
+The proxy target "http://localhost:5000" is hardcoded in vite.config.js.
+The backend port 5000 comes from .env (PORT=5000).
+
+================================================================================
+7. HARDCODED ANSWERS, API KEYS, TOKENS, OR SECRETS
+================================================================================
+
+Hardcoded answers:
+  src/App.jsx                           defaultInitialResponse (lines 4–16): demo cheque bounce answer, trust_score 92, 3 sources
+  src/App.jsx                           catch block in handleSend (lines 284–296): fallback answer on error, trust_score 88
+  server/services/ragEngine.js          synthesizeFallbackAnswer(): hardcoded legal answers for cheque/FIR/maintenance/bail
+  server/services/ragEngine.js          Conversational intent responses (greeting, identity, thanks)
+  server/data/legalKnowledgeBase.js     Entire file: 12 statutes + 8 case laws + sample suggestions + categories
+
+API key references (read from env, NOT hardcoded values):
+  .env.example                          GEMINI_API_KEY=, OPENAI_API_KEY=, GROQ_API_KEY= (empty placeholders only)
+  server/services/llmService.js         Reads keys from process.env
+
+No actual API keys, tokens, or secrets are committed to the repo.
+The .env file contains only PORT=5000.
+.gitignore correctly excludes .env and .env*.local.
+
+================================================================================
+8. BUILD & RUN STATUS
+================================================================================
+
+Build:   YES — `vite build` succeeds (exit code 0).
+         Output: dist/index.html (0.46 KB), dist/assets/index-CvYmIZJt.css (9.56 KB),
+         dist/assets/index-qP0yN4Je.js (209.05 KB). Built in 411ms. No errors.
+
+Run:     YES — `npm run dev` is currently running (Vite dev server on port 5173).
+         No errors observed.
+
+Note:    The Express backend (npm run server, port 5000) must also be running for
+         /api/* calls to succeed. Without it, all chat requests fail silently and
+         the UI injects hardcoded fallback answers with no error shown to user.
+
+================================================================================
+9. GITHUB REPO & BRANCH
+================================================================================
+
+Repo   : https://github.com/Asifeease/trustrag.git
+Branch : main
